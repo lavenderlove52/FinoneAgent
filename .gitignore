@@ -30,6 +30,12 @@ htmlcov/
 build/
 dist/
 *.egg-info/
+*.tsbuildinfo
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
 
 # Logs
 *.log
@@ -44,3 +50,4 @@ cache/
 # OS files
 .DS_Store
 Thumbs.db
+/frontend/node_modules/

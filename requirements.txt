@@ -1,4 +1,9 @@
 openai
 langgraph
 langchain
-
+fastapi
+uvicorn[standard]
+python-multipart
+PyJWT
+bcrypt
+python-dotenv
