@@ -1,5 +1,6 @@
 import React, { useEffect, useRef } from 'react'
 import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import type { Message } from '../api/types'
 
 interface Props {
@@ -39,7 +40,7 @@ export default function MessageBubble({ message, isStreaming = false }: Props) {
               isStreaming ? 'h-60 overflow-y-auto pr-3' : ''
             }`}
           >
-            <ReactMarkdown>{message.content}</ReactMarkdown>
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
           </div>
         )}
       </div>
