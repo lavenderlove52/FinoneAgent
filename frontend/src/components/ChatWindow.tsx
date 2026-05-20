@@ -19,13 +19,18 @@ export default function ChatWindow({ session, onSessionUpdated }: Props) {
   const [input, setInput] = useState('')
   const [streaming, setStreaming] = useState(false)
   const [streamingMessageId, setStreamingMessageId] = useState<number | null>(null)
+  // 区分思考阶段（thinking 事件）和答案阶段（chunk 事件）
+  const [thinkingPhaseId, setThinkingPhaseId] = useState<number | null>(null)
   const [loading, setLoading] = useState(false)
+  // thinking content keyed by message id (temp or real)
+  const [thinkingMap, setThinkingMap] = useState<Record<number, string>>({})
   const messagesRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
 
   useEffect(() => {
     if (!session) {
       setMessages([])
+      setThinkingMap({})
       return
     }
     setLoading(true)
@@ -37,12 +42,7 @@ export default function ChatWindow({ session, onSessionUpdated }: Props) {
   useEffect(() => {
     const container = messagesRef.current
     if (!container) return
-
-    // Streaming 时使用立即滚动，避免每个 chunk 都触发平滑动画导致输入区抖动。
-    container.scrollTo({
-      top: container.scrollHeight,
-      behavior: 'auto',
-    })
+    container.scrollTo({ top: container.scrollHeight, behavior: 'auto' })
   }, [messages, streaming])
 
   const sendMessage = useCallback(async () => {
@@ -76,6 +76,7 @@ export default function ChatWindow({ session, onSessionUpdated }: Props) {
     }
     setMessages((prev) => [...prev, assistantMsg])
     setStreamingMessageId(assistantMsgId)
+    setThinkingPhaseId(assistantMsgId)   // 开始时处于思考阶段
 
     try {
       const token = localStorage.getItem('token')
@@ -109,7 +110,16 @@ export default function ChatWindow({ session, onSessionUpdated }: Props) {
           if (!jsonStr) continue
           try {
             const event = JSON.parse(jsonStr)
-            if (event.type === 'chunk') {
+
+            if (event.type === 'thinking') {
+              // 累积思考内容到当前 assistant 消息
+              setThinkingMap((prev) => ({
+                ...prev,
+                [assistantMsgId]: (prev[assistantMsgId] ?? '') + event.content,
+              }))
+            } else if (event.type === 'chunk') {
+              // 收到第一个答案 chunk，结束思考阶段
+              setThinkingPhaseId(null)
               setMessages((prev) =>
                 prev.map((m) =>
                   m.id === assistantMsgId
@@ -118,12 +128,24 @@ export default function ChatWindow({ session, onSessionUpdated }: Props) {
                 )
               )
             } else if (event.type === 'done') {
+              const realId: number = event.message_id
+              // 更新消息 ID
               setMessages((prev) =>
-                prev.map((m) =>
-                  m.id === assistantMsgId ? { ...m, id: event.message_id } : m
-                )
+                prev.map((m) => (m.id === assistantMsgId ? { ...m, id: realId } : m))
               )
+              // 迁移 thinking 到真实 ID
+              setThinkingMap((prev) => {
+                const next = { ...prev }
+                if (next[assistantMsgId] !== undefined) {
+                  next[realId] = event.thinking ?? next[assistantMsgId]
+                  delete next[assistantMsgId]
+                } else if (event.thinking) {
+                  next[realId] = event.thinking
+                }
+                return next
+              })
               setStreamingMessageId(null)
+              setThinkingPhaseId(null)
               onSessionUpdated?.()
             } else if (event.type === 'error') {
               setMessages((prev) =>
@@ -134,6 +156,7 @@ export default function ChatWindow({ session, onSessionUpdated }: Props) {
                 )
               )
               setStreamingMessageId(null)
+              setThinkingPhaseId(null)
             }
           } catch {
             // ignore parse errors
@@ -149,8 +172,11 @@ export default function ChatWindow({ session, onSessionUpdated }: Props) {
         )
       )
       setStreamingMessageId(null)
+      setThinkingPhaseId(null)
     } finally {
       setStreaming(false)
+      setStreamingMessageId(null)
+      setThinkingPhaseId(null)
       textareaRef.current?.focus()
     }
   }, [session, input, streaming, onSessionUpdated])
@@ -194,6 +220,8 @@ export default function ChatWindow({ session, onSessionUpdated }: Props) {
               key={msg.id}
               message={msg}
               isStreaming={streaming && msg.id === streamingMessageId}
+              thinking={thinkingMap[msg.id]}
+              isThinkingStreaming={msg.id === thinkingPhaseId}
             />
           ))
         )}

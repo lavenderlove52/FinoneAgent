@@ -15,8 +15,8 @@ class LLMSettings:
 
     api_key: str | None
     base_url: str = "https://aigw.fosunwealth.com/v1"
-    model: str = "claude-opus-4.6"
-
+    # model: str = "claude-opus-4.6"
+    model: str = "deepseek-v4-flash"
     @classmethod
     def from_env(cls) -> "LLMSettings":
         return cls(

@@ -6,9 +6,9 @@ from collections.abc import Iterator
 from typing import Any
 
 from backend.agents.base import AgentState, BaseAgent
-from backend.agents.reasoning.answer_validator import AnswerValidator
 from backend.agents.reasoning.prompts import (
     BEGIN_SEARCH_RESULT,
+    END_SEARCH_RESULT,
     FINAL_ANSWER_PROMPT,
     MAX_SEARCH_LIMIT,
     RELEVANT_EXTRACTION_PROMPT,
@@ -20,6 +20,9 @@ from backend.retrievers.base import Retriever
 from backend.retrievers.markdown import MarkdownRetriever
 from backend.retrievers.sqlite import SQLiteRetriever
 
+
+# 思考进度流前缀，chat.py 用该前缀区分思考事件和最终答案 chunk
+THINKING_PREFIX = "\x00THINK:"
 
 SYSTEM_PROMPT = """你是 FinoneAgent DeepResearch 助手。
 你只能基于给定的本地知识库检索结果回答；如果证据不足，请说明不足之处。
@@ -39,7 +42,6 @@ class DeepResearchAgent(BaseAgent):
         super().__init__(**kwargs)
         self.thinking_engine = ThinkingEngine(self.llm_client)
         self.query_generator = QueryGenerator(self.llm_client)
-        self.answer_validator = AnswerValidator()
 
     # ------------------------------------------------------------------
     # BaseAgent hooks
@@ -78,116 +80,19 @@ class DeepResearchAgent(BaseAgent):
 
     def ask_stream(self, query: str) -> Iterator[str]:
         """
-        Synchronous streaming: yield progress during retrieval then stream
-        the final answer token-by-token.
+        同步流式：实时 yield 每条思考进度（THINKING_PREFIX 前缀），
+        检索完成后再流式生成最终答案。
         """
-        logs: list[str] = []
+        think = ""
         all_retrieved_info: list[str] = []
 
-        self.thinking_engine.initialize_with_query(query)
-        initial_sub_queries = self.query_generator.generate_sub_queries(query)
+        for event in self._research_loop_events(query):
+            if event[0] == "progress":
+                # 实时转发思考进度，前端可立即收到
+                yield f"{THINKING_PREFIX}{event[1]}"
+            elif event[0] == "done":
+                _, think, all_retrieved_info, _ = event
 
-        think = f"我需要回答问题：{query}\n\n为了全面解答，我将从以下方面研究：\n"
-        for i, sq in enumerate(initial_sub_queries, 1):
-            think += f"{i}. {sq}\n"
-        think += "\n让我逐步进行搜索和分析。"
-        self.thinking_engine.add_reasoning_step(think)
-
-        for iteration in range(MAX_SEARCH_LIMIT):
-            if iteration >= MAX_SEARCH_LIMIT - 1:
-                break
-
-            self.thinking_engine.update_continue_message()
-
-            if iteration == 0:
-                queries_to_process = initial_sub_queries[:2]
-            else:
-                result = self.thinking_engine.generate_next_query()
-                if result["status"] == "answer_ready":
-                    break
-                elif result["status"] in ("error", "empty"):
-                    hypotheses = self.query_generator.generate_multiple_hypotheses(query)
-                    if hypotheses:
-                        queries_to_process = hypotheses
-                    else:
-                        break
-                else:
-                    content = result.get("content") or ""
-                    think += self.thinking_engine.remove_query_tags(content)
-                    queries_to_process = result["queries"]
-
-            if not queries_to_process:
-                if not all_retrieved_info:
-                    queries_to_process = [query]
-                else:
-                    followup = self.query_generator.generate_followup_queries(
-                        query, all_retrieved_info
-                    )
-                    if followup:
-                        queries_to_process = followup
-                    else:
-                        break
-
-            for search_query in queries_to_process:
-                if self.thinking_engine.has_executed_query(search_query):
-                    continue
-                self.thinking_engine.add_executed_query(search_query)
-
-                yield f"**正在搜索：{search_query}**\n"
-
-                results = []
-                for retriever in self.retrievers:
-                    results.extend(retriever.search(search_query, top_k=3))
-
-                if not results:
-                    no_result_msg = f"\n没有找到与'{search_query}'相关的信息。\n"
-                    self.thinking_engine.add_human_message(no_result_msg)
-                    think += no_result_msg
-                    continue
-
-                doc_text = self._format_context(results)
-                prev_reasoning = self.thinking_engine.prepare_truncated_reasoning()
-                extract_msgs = [
-                    {
-                        "role": "system",
-                        "content": RELEVANT_EXTRACTION_PROMPT.format(
-                            prev_reasoning=prev_reasoning,
-                            search_query=search_query,
-                            document=doc_text,
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            f'基于当前的搜索查询"{search_query}"，'
-                            "分析每个知识来源并找出有用信息。"
-                        ),
-                    },
-                ]
-                summary = self.llm_client.complete(extract_msgs)
-
-                if (
-                    "**Final Information**" in summary
-                    and "No helpful information found" not in summary
-                ):
-                    useful = summary.split("**Final Information**")[1].strip()
-                    all_retrieved_info.append(useful)
-
-                self.thinking_engine.add_reasoning_step(summary)
-                self.thinking_engine.add_human_message(
-                    f"\n{BEGIN_SEARCH_RESULT}{summary}{BEGIN_SEARCH_RESULT}\n"
-                )
-                think += self.thinking_engine.remove_result_tags(summary)
-
-            if iteration > 0 and all_retrieved_info:
-                followup = self.query_generator.generate_followup_queries(
-                    query, all_retrieved_info
-                )
-                if not followup:
-                    think += "\n已收集到足够的信息，可以开始整合分析了。"
-                    break
-
-        # Stream final answer
         if not all_retrieved_info:
             yield f"抱歉，我无法找到关于'{query}'的相关信息。"
         else:
@@ -213,17 +118,13 @@ class DeepResearchAgent(BaseAgent):
     # Core multi-round reasoning
     # ------------------------------------------------------------------
 
-    def thinking(self, query: str) -> dict[str, Any]:
+    def _research_loop_events(self, query: str) -> Iterator[tuple]:
         """
-        Execute multi-round deep research reasoning.
+        核心多轮检索推理生成器。
 
-        Returns:
-            {
-                thinking_process: str,
-                answer: str,
-                retrieved_info: list[str],
-                execution_logs: list[str],
-            }
+        每发现进度信息即 yield ("progress", msg)，
+        循环结束时 yield ("done", think, all_retrieved_info, logs)。
+        调用方可选择实时处理 progress（流式）或统一收集（批量）。
         """
         logs: list[str] = []
         all_retrieved_info: list[str] = []
@@ -236,13 +137,15 @@ class DeepResearchAgent(BaseAgent):
             think += f"{i}. {sq}\n"
         think += "\n让我逐步进行搜索和分析。"
         self.thinking_engine.add_reasoning_step(think)
+        yield ("progress", think)
 
-        for iteration in range(MAX_SEARCH_LIMIT):
-            if iteration >= MAX_SEARCH_LIMIT - 1:
+        for iteration in range(MAX_SEARCH_LIMIT + 1):
+            if iteration >= MAX_SEARCH_LIMIT:
                 logs.append(f"iteration={iteration}: reached MAX_SEARCH_LIMIT")
                 break
 
             self.thinking_engine.update_continue_message()
+            queries_to_process: list[str] = []
 
             if iteration == 0:
                 queries_to_process = initial_sub_queries[:2]
@@ -256,11 +159,15 @@ class DeepResearchAgent(BaseAgent):
                     if hypotheses:
                         queries_to_process = hypotheses
                     else:
-                        logs.append(f"iteration={iteration}: error/empty, no hypotheses")
+                        logs.append(f"iteration={iteration}: no hypotheses, stopping")
                         break
                 else:
                     content = result.get("content") or ""
-                    think += self.thinking_engine.remove_query_tags(content)
+                    clean_content = self.thinking_engine.remove_query_tags(content)
+                    think += clean_content
+                    # 将 LLM 的推理过程也实时展示在思考面板
+                    if clean_content.strip():
+                        yield ("progress", clean_content)
                     queries_to_process = result["queries"]
 
             if not queries_to_process:
@@ -278,20 +185,24 @@ class DeepResearchAgent(BaseAgent):
 
             for search_query in queries_to_process:
                 if self.thinking_engine.has_executed_query(search_query):
-                    logs.append(f"skip duplicate query: {search_query}")
+                    logs.append(f"skip duplicate: {search_query}")
                     continue
                 self.thinking_engine.add_executed_query(search_query)
-                think += f"\n\n> 搜索：{search_query}\n\n"
+
+                progress = f"**正在搜索：{search_query}**\n"
+                think += f"\n{progress}"
+                yield ("progress", progress)
                 logs.append(f"search: {search_query}")
 
-                results = []
+                results: list = []
                 for retriever in self.retrievers:
                     results.extend(retriever.search(search_query, top_k=3))
 
                 if not results:
-                    no_result_msg = f"\n没有找到与'{search_query}'相关的信息。\n"
-                    self.thinking_engine.add_human_message(no_result_msg)
-                    think += no_result_msg
+                    msg = f"未找到与「{search_query}」相关的信息，尝试其他方向。\n"
+                    self.thinking_engine.add_human_message(msg)
+                    think += msg
+                    yield ("progress", msg)
                     continue
 
                 doc_text = self._format_context(results)
@@ -313,6 +224,7 @@ class DeepResearchAgent(BaseAgent):
                         ),
                     },
                 ]
+                yield ("progress", f"正在提取「{search_query}」的相关信息…\n")
                 summary = self.llm_client.complete(extract_msgs)
 
                 if (
@@ -321,10 +233,14 @@ class DeepResearchAgent(BaseAgent):
                 ):
                     useful = summary.split("**Final Information**")[1].strip()
                     all_retrieved_info.append(useful)
+                    # 完整提取内容，前端思考面板可看到全部分析结果
+                    yield ("progress", f"✓ 提取到相关信息：\n\n{useful}\n")
+                else:
+                    yield ("progress", "此次搜索未提取到有效信息。\n")
 
                 self.thinking_engine.add_reasoning_step(summary)
                 self.thinking_engine.add_human_message(
-                    f"\n{BEGIN_SEARCH_RESULT}{summary}{BEGIN_SEARCH_RESULT}\n"
+                    f"\n{BEGIN_SEARCH_RESULT}{summary}{END_SEARCH_RESULT}\n"
                 )
                 think += self.thinking_engine.remove_result_tags(summary)
 
@@ -333,11 +249,35 @@ class DeepResearchAgent(BaseAgent):
                     query, all_retrieved_info
                 )
                 if not followup:
-                    think += "\n已收集到足够的信息，可以开始整合分析了。"
+                    done_msg = "\n已收集到足够的信息，开始生成最终回答…\n"
+                    think += done_msg
+                    yield ("progress", done_msg)
                     logs.append(f"iteration={iteration}: sufficient info, stopping")
                     break
 
-        # Generate final answer
+        yield ("done", think, all_retrieved_info, logs)
+
+    def thinking(self, query: str) -> dict[str, Any]:
+        """
+        Execute multi-round deep research reasoning.
+
+        Returns:
+            {
+                thinking_process: str,
+                answer: str,
+                retrieved_info: list[str],
+                execution_logs: list[str],
+            }
+        """
+        think = ""
+        all_retrieved_info: list[str] = []
+        logs: list[str] = []
+
+        for event in self._research_loop_events(query):
+            if event[0] == "done":
+                _, think, all_retrieved_info, logs = event
+            # progress 事件在非流式模式下静默忽略
+
         if not all_retrieved_info:
             answer = f"抱歉，我无法找到关于'{query}'的相关信息。"
         else:

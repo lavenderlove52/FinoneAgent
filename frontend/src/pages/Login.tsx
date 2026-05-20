@@ -9,13 +9,14 @@ export default function Login() {
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
   const navigate = useNavigate()
-  const { login, isAuthenticated } = useAuth()
+  const { login, isAuthenticated, initializing } = useAuth()
 
   useEffect(() => {
+    if (initializing) return   // 等待 /me 校验完成
     if (isAuthenticated) {
       navigate('/chat', { replace: true })
     }
-  }, [isAuthenticated, navigate])
+  }, [isAuthenticated, initializing, navigate])
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()

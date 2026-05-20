@@ -110,7 +110,7 @@ export default function Admin() {
                         {u.role === 'admin' ? '管理员' : '普通用户'}
                       </span>
                     </td>
-                    <td className="px-6 py-3 text-slate-400">{(u as unknown as { created_at: string }).created_at}</td>
+                    <td className="px-6 py-3 text-slate-400">{u.created_at}</td>
                     <td className="px-6 py-3 text-right">
                       {u.id !== currentUser?.id && (
                         <button

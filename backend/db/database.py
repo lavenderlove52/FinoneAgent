@@ -57,6 +57,7 @@ def init_db() -> None:
                 ("admin", password_hash, "admin"),
             )
             conn.commit()
+            print("⚠️  警告：已创建默认管理员账号 admin/admin123，请登录后立即修改密码！")
 
 
 if __name__ == "__main__":
